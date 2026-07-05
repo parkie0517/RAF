@@ -1,0 +1,155 @@
+# from RL_3DOD
+# I modified so that the code:
+#   * encodes lidar data only
+#   * converts each output of the spconv layer into a bev feature
+# returns
+#   * concatenated bev features
+#   * encoded lidar feature and indices
+
+import os
+
+import torch
+import torch.nn as nn
+
+import spconv.pytorch as spconv
+from einops.layers.torch import Rearrange
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+
+
+class RL3DFBackbone(nn.Module):
+    def __init__(self, 
+                 model_cfg,
+                 point_cloud_range, # [ 0. , -6.4, -2. , 72. ,  6.4,  6. ]
+                 grid_size, # 0.4
+                 input_dim, # 4
+                 ):
+        super(RL3DFBackbone, self).__init__()
+        self.model_cfg = model_cfg
+
+        x_min, x_max = point_cloud_range[0], point_cloud_range[3]
+        y_min, y_max = point_cloud_range[1], point_cloud_range[4]
+        z_min, z_max = point_cloud_range[2], point_cloud_range[5]
+
+        # round instead of truncating to avoid odd shapes from float precision (e.g., 9.6/0.4 -> 23.999)
+        z_shape = int(np.round((z_max - z_min) / grid_size)) # 20
+        y_shape = int(np.round((y_max - y_min) / grid_size)) # 32
+        x_shape = int(np.round((x_max - x_min) / grid_size)) # 180
+
+        self.spatial_shape = [z_shape, y_shape, x_shape] # [20, 32, 180]
+
+        list_enc_channel = model_cfg.ENCODING.CHANNEL # [64, 128, 256]
+        list_enc_padding = model_cfg.ENCODING.PADDING # [1, 1, 1]
+        list_enc_stride  = model_cfg.ENCODING.STRIDE # [1, 2, 2]
+        
+        
+        # 1x1 conv / 4->ENCODING.CHANNEL[0]
+        self.input_convL = spconv.SparseConv3d(
+            in_channels=input_dim, out_channels=list_enc_channel[0],
+            kernel_size=1, stride=1, padding=0, dilation=1, indice_key = 'sp0') 
+        
+        
+        # encoder
+        self.num_layer = len(list_enc_channel) # 3
+        for idx_enc in range(self.num_layer):
+            if idx_enc == 0:
+                temp_in_ch = list_enc_channel[0] 
+            else:
+                temp_in_ch = list_enc_channel[idx_enc-1]
+            temp_ch = list_enc_channel[idx_enc]
+            temp_pd = list_enc_padding[idx_enc]
+            
+            setattr(self, f'spconv{idx_enc}L', \
+                spconv.SparseConv3d(in_channels=temp_in_ch, out_channels=temp_ch, kernel_size=3, \
+                    stride=list_enc_stride[idx_enc], padding=temp_pd, dilation=1, indice_key=f'sp{idx_enc}'))
+            setattr(self, f'bn{idx_enc}L', nn.BatchNorm1d(temp_ch))
+            setattr(self, f'subm{idx_enc}aL', \
+                spconv.SubMConv3d(in_channels=temp_ch, out_channels=temp_ch, kernel_size=3, stride=1, padding=0, dilation=1, indice_key=f'subm{idx_enc}'))
+            setattr(self, f'bn{idx_enc}aL', nn.BatchNorm1d(temp_ch))
+            setattr(self, f'subm{idx_enc}bL', \
+                spconv.SubMConv3d(in_channels=temp_ch, out_channels=temp_ch, kernel_size=3, stride=1, padding=0, dilation=1, indice_key=f'subm{idx_enc}'))
+            setattr(self, f'bn{idx_enc}bL', nn.BatchNorm1d(temp_ch))
+
+
+        # to BEV modules
+        list_bev_channel = model_cfg.TO_BEV.CHANNEL   # [256, 256, 256]
+        list_bev_kernel  = model_cfg.TO_BEV.KERNEL_SIZE # [3, 6, 12]
+        list_bev_stride  = model_cfg.TO_BEV.STRIDE      # [1, 2, 4]
+        list_bev_padding = model_cfg.TO_BEV.PADDING     # [1, 2, 4]
+
+        for idx_bev in range(self.num_layer):
+            temp_enc_ch = list_enc_channel[idx_bev]
+            temp_out_channel = list_bev_channel[idx_bev]
+            z_kernel_size = int(z_shape / (2**idx_bev)) # z축 collapse 하기 위한 크기
+
+            setattr(self, f'toBEV{idx_bev}L',
+                spconv.SparseConv3d(in_channels=temp_enc_ch,
+                    out_channels=temp_enc_ch, kernel_size=(z_kernel_size, 1, 1)))
+            setattr(self, f'bnBEV{idx_bev}L', nn.BatchNorm1d(temp_enc_ch))
+            setattr(self, f'convtrans2d{idx_bev}L',
+                nn.ConvTranspose2d(in_channels=temp_enc_ch, out_channels=temp_out_channel,
+                    kernel_size=list_bev_kernel[idx_bev], stride=list_bev_stride[idx_bev],
+                    padding=list_bev_padding[idx_bev]))
+            setattr(self, f'bnt{idx_bev}L', nn.BatchNorm2d(temp_out_channel))
+
+        
+        
+        # bev feature map의 output channel 구하기
+        self.bev_output_channel = 0
+        for i in range(self.num_layer):
+            self.bev_output_channel += list_bev_channel[i]
+        
+        
+        # activation
+        self.relu = nn.ReLU()
+
+
+    def forward(self, batch_dict):
+        sparse_featuresL, sparse_indicesL = batch_dict['sp_features_l'], batch_dict['sp_indices_l'] # [N, 4]
+
+        input_sp_tensorL = spconv.SparseConvTensor(
+            features=sparse_featuresL, # [N, 4]
+            indices=sparse_indicesL.int(), # [N, 4]
+            spatial_shape=self.spatial_shape, # [20, 32, 180]
+            batch_size=batch_dict['batch_size']
+        )
+
+        xL = self.input_convL(input_sp_tensorL) # SparseConv3d # eg. [N, 4] -> [N, 4]
+        list_bev_featuresL = []
+        
+        for idx_layer in range(self.num_layer):
+            # eg. [15488, 64] -> [12991, 64] -> [3581, 128] -> [1186, 256]
+            xL = getattr(self, f'spconv{idx_layer}L')(xL) # SparseConv3d # 요기서 spatial shape 고려해서 알아서 잘라줌
+            xL = xL.replace_feature(getattr(self, f'bn{idx_layer}L')(xL.features))
+            xL = xL.replace_feature(self.relu(xL.features))
+            xL = getattr(self, f'subm{idx_layer}aL')(xL)
+            xL = xL.replace_feature(getattr(self, f'bn{idx_layer}aL')(xL.features))
+            xL = xL.replace_feature(self.relu(xL.features))
+            xL = getattr(self, f'subm{idx_layer}bL')(xL)
+            xL = xL.replace_feature(getattr(self, f'bn{idx_layer}bL')(xL.features))
+            xL = xL.replace_feature(self.relu(xL.features))
+
+            # to BEV
+            bev_spL = getattr(self, f'toBEV{idx_layer}L')(xL) # z축을 1로 변환
+            bev_spL = bev_spL.replace_feature(getattr(self, f'bnBEV{idx_layer}L')(bev_spL.features))
+            bev_spL = bev_spL.replace_feature(self.relu(bev_spL.features))
+
+            bev_denseL = getattr(self, f'convtrans2d{idx_layer}L')(bev_spL.dense().squeeze(2)) # bev feature ----> [B, C, 32, 180] 
+            bev_denseL = getattr(self, f'bnt{idx_layer}L')(bev_denseL)
+            bev_denseL = self.relu(bev_denseL)
+
+            list_bev_featuresL.append(bev_denseL)
+
+        # concat all layer BEV features
+        bev_featuresL = torch.cat(list_bev_featuresL, dim=1) # [4, 768, 32, 180]
+        
+        ################################ 디버깅 #################################
+        # device = bev_featuresL.device
+        # dtype = bev_featuresL.dtype
+        # bev_featuresL = torch.randn((4, 768, 40, 240), device=device, dtype=dtype) # [4, 768, 32, 180] ----> [4, 768, 40, 240]
+        ################################ 디버깅 #################################
+        batch_dict['spatial_features_2d'] = bev_featuresL # [4, 768, 32, 180]
+        batch_dict['uem_lidar_feature'] = xL.features # [N_new, 256]
+        batch_dict['uem_lidar_indices'] = xL.indices # [N_new, 4] # [B, Z, Y, X]
+        
+        return batch_dict

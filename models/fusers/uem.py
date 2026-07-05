@@ -1,0 +1,290 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+class FeatureAlignmentMLP(nn.Module):
+    def __init__(self, input_dim=256, hidden_dim=128, output_dim=128, dropout=0.1):
+        super(FeatureAlignmentMLP, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+
+class UEM(nn.Module):
+
+
+    def __init__(self,
+                 model_cfg,
+                 point_cloud_range, # [ 0. , -6.4, -2. , 72. ,  6.4,  6. ]
+                 voxel_size, # 0.4
+                 encoder_stride, # [1, 2, 2]
+                 uem_loss_dict,
+                 **kwargs # {}
+                 ):
+        super().__init__()
+        self.model_cfg = model_cfg
+        self.voxel_size = voxel_size
+        total_stride = 1
+        for n in encoder_stride:
+            total_stride *= n
+        self.scaled_voxel_size = voxel_size * total_stride # 0.4 * 4 = 1.6
+        self.x_min, self.y_min, self.z_min = point_cloud_range[0], point_cloud_range[1], point_cloud_range[2], # 0.0, -6.4, -2.0
+        
+        
+        # f_grid를 위한 grid offsets 만들기
+        self.patch_size = model_cfg.PATCH_SIZE # 5
+        offset = self.patch_size // 2 # 2
+
+        dx = torch.arange(-offset, offset + 1) # [-2, -1, 0, 1, 2]
+        dy = torch.arange(-offset, offset + 1) # [-2, -1, 0, 1, 2]
+        grid_y, grid_x = torch.meshgrid(dy, dx, indexing='ij')
+        self.grid_offsets = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)  # [25, 2]
+        self.grid_offsets = self.grid_offsets.cuda()
+        
+        self.offset_x = grid_x.unsqueeze(0).cuda()  # [5, 5] -> [1, 5, 5]
+        self.offset_y = grid_y.unsqueeze(0).cuda()  # [5, 5] -> [1, 5, 5]
+        
+        # latent space 보내는데 필요한 모델
+        self.lidar_projector = FeatureAlignmentMLP()
+        self.image_projector = FeatureAlignmentMLP()
+        
+        
+        # conf map 초기화 값
+        self.uncertain_init = self.model_cfg.get('UNCERTAIN_INIT', 0.0)
+        
+        # loss 관련
+        self.uem_loss_dict = uem_loss_dict
+        
+        
+    def get_similarity_loss(self, tb_dict=None):
+        # loss 계산
+        climate_weight_list = []
+        for climate in self.climate_list:
+            if climate in ("normal", "overcast"):
+                climate_weight_list.append(self.uem_loss_dict['positive'])
+            else:
+                climate_weight_list.append(self.uem_loss_dict['negative'])
+        climate_weight_tensor = torch.tensor(climate_weight_list, dtype=torch.float32, device=self.similarity.device)
+        climate_weights = climate_weight_tensor[self.valid_b]
+        uem_loss = 1 - self.similarity
+        uem_loss = uem_loss * climate_weights
+        uem_loss = uem_loss.mean()
+        
+        uem_loss = uem_loss * self.uem_loss_dict['uem_loss_weight'] # uem에 맞는 거 갖고오기
+        
+        tb_dict.update({
+            'uem_loss': uem_loss.item(),
+        })
+        return uem_loss, tb_dict
+    
+        
+    def get_loss(self, tb_dict=None):
+        tb_dict = {} if tb_dict is None else tb_dict
+        uem_loss, tb_dict_uem = self.get_similarity_loss(tb_dict)
+
+        return uem_loss, tb_dict_uem
+       
+    
+    def forward(self, feature_map, batch_dict):
+        
+        
+        # 0. 준비물
+        lidar_feature = batch_dict['uem_lidar_feature'] # [N, 256]
+        lidar_indices = batch_dict['uem_lidar_indices'] # [N, 4] # (B, Z, Y, X)
+        B = batch_dict['batch_size']
+        self.climate_list = batch_dict['climate_list'] # loss 계산할 때 필요
+        
+        
+        # 1. voxel 중심 좌표 구하기
+        b, z_indices, y_indices, x_indices = lidar_indices[:, 0].long(), lidar_indices[:, 1], lidar_indices[:, 2], lidar_indices[:, 3]
+        x_center = self.x_min + (x_indices.float() + 0.5) * self.scaled_voxel_size # NOTE 0.5를 더하는 이유는 voxel의 중심을 구하고 싶어서
+        y_center = self.y_min + (y_indices.float() + 0.5) * self.scaled_voxel_size
+        z_center = self.z_min + (z_indices.float() + 0.5) * self.scaled_voxel_size
+        coords_center = torch.stack([x_center, y_center, z_center], dim=-1)  # [N, 3]
+        coords_center = torch.cat([coords_center, torch.ones((coords_center.shape[0], 1), device=coords_center.device)], dim=-1) # [N, 3] -> [N, 4]
+        
+        
+        
+        # 2. voxel 중심을 이미지에 projection
+        # 2.1. lidar 2 feature map 행렬 구하기
+        intrinsic = batch_dict['camera2image'].clone() # lss 모듈 안에서 또 다시 필요하므로 clone하기
+        intrinsic = intrinsic[0, 0] # 어짜피 배치 안에 모든 샘플의 intrinsic은 동일하다.
+        
+        _, _, _, ori_h, ori_w = batch_dict['front0'].shape # [320, 640]
+        _, _, feat_h, feat_w = feature_map.shape # [40, 80]
+        
+        scale_w = ori_w/feat_w # 8.0
+        scale_h = ori_h/feat_h # 8.0
+        
+        intrinsic[0, 0] /= scale_w  # fx
+        intrinsic[0, 2] /= scale_w  # cx
+        intrinsic[1, 1] /= scale_h  # fy
+        intrinsic[1, 2] /= scale_h  # cy
+        
+        ldr2cam = batch_dict['lidar2camera'][0, 0] # [4, 4]
+        cam2feat = intrinsic # [4, 4]
+        ldr2feat = torch.matmul(cam2feat, ldr2cam) # [4, 4]
+        
+        
+        
+        # 2.2. projection 수행
+        proj_coords = coords_center @ ldr2feat.T # [N, 4]
+        eps = 1e-6  # divide by zero 방지
+        depth = proj_coords[:, 2]
+        proj_coords = proj_coords[:, :2] / (proj_coords[:, 2:3] + eps)  # [N, 2]
+        
+        u = proj_coords[:, 0]
+        v = proj_coords[:, 1]
+        valid_mask = (u >= 0) & (u < feat_w) & (v >= 0) & (v < feat_h) # feature map 경계 검사
+        proj_coords = proj_coords[valid_mask] # [N_new, 2]
+        depth = depth[valid_mask] # [N_new]
+        N_new = (valid_mask == True).sum().item() # eg. 1186 -> 1172
+        
+        
+        # 3. 이미지 feature 샘플링 
+        # 3.1. depth 기반 샘플링할 커널 사이즈 구하기 (novelty)
+        fx = intrinsic[0, 0]
+        fy = intrinsic[1, 1]
+        sample_w = fx * self.voxel_size / depth # [N_new]
+        sample_h = fy * self.voxel_size / depth # [N_new]
+        
+        kernel_w = torch.clamp(sample_w.floor(), 0, 4) # values are in b/w 0~4
+        kernel_h = torch.clamp(sample_h.floor(), 0, 4)
+        radius_w = torch.ceil(kernel_w / 2).long() # now in 0,1,2
+        radius_h = torch.ceil(kernel_h / 2).long()
+
+        # 3.2. F.grid_sample에 필요한 좌표들 생성 및 유효 마스크 생성 (NOTE 유효 마스크를 왜 생성하냐? proj_coords img feat안인데, expansion을 하면서 밖에 나가는 좌표가 생길 수 있음. 이런 경우, 밖에 있는 애들은 최종 feature 계산에서 제외시켜야 함)
+        coords_expanded = proj_coords.unsqueeze(1) + self.grid_offsets.unsqueeze(0) # [N_new, 25, 2] # 좌표 expansion
+        
+        flat_coords = coords_expanded.view(-1, 2)
+        expanded_u = flat_coords[:, 0]
+        expanded_v = flat_coords[:, 1]
+        valid_coord_mask = (expanded_u >= 0) & (expanded_u < feat_w) & (expanded_v >= 0) & (expanded_v < feat_h)
+        valid_coord_mask = valid_coord_mask.view(N_new, self.patch_size, self.patch_size).float()  # [N_new, 5, 5]
+
+        
+        indices_expanded = coords_expanded.long() # conf map 생성할 때 index로 사용될 예정
+        norm_coords = coords_expanded
+        norm_coords[..., 0] = (norm_coords[..., 0] / (feat_w - 1)) * 2 - 1  # x
+        norm_coords[..., 1] = (norm_coords[..., 1] / (feat_h - 1)) * 2 - 1  # y
+        norm_coords = norm_coords.view(-1, self.patch_size, self.patch_size, 2)  # [N_new, 25, 2] -> [N_new, 5, 5, 2]
+        
+        valid_b = b[valid_mask] # [N_new]
+        self.valid_b = valid_b # loss 계산할 때 필요
+        selected_feat = feature_map[valid_b] # [N_new, C, H, W]
+        sampled_feat = F.grid_sample(selected_feat, norm_coords, mode='bilinear', padding_mode='zeros', align_corners=True)  # [N_new, 256, 5, 5]
+        
+
+        # 3.3. 커널 사이즈에 일치하는 mask 생성하기
+        offset_y = self.offset_y.expand(N_new, -1, -1)  # [1, 5, 5] -> [N_new, 5, 5]
+        offset_x = self.offset_x.expand(N_new, -1, -1)
+        radius_h = radius_h.view(-1, 1, 1) # [N_new] -> [N_new, 1, 1]
+        radius_w = radius_w.view(-1, 1, 1)
+        
+        radius_mask = (
+            (offset_y.abs() <= radius_h) &
+            (offset_x.abs() <= radius_w)
+        ).float()  # [N_new, 5, 5]
+        mask = radius_mask * valid_coord_mask  # [N_new, 5, 5]
+        
+        # 3.4. 커널 사이즈에 맞는 feature들을 (5x5) 그리드에서 샘플링하기
+        masked_feat = sampled_feat * mask.unsqueeze(1)  # [N_new, 256, 5, 5]
+        
+        
+        # 3.5. 커널 안에 있는 feature들 평균내기
+        sum_feat = masked_feat.sum(dim=(-1, -2))  # [N_new, 256]
+        valid_count = mask.sum(dim=(-1, -2))  # [N_new] # mask 중에 valid한 개수 count 1~25 사이의 값일 거임
+        mean_feat = sum_feat / valid_count.unsqueeze(-1) # [N_new, 256]
+        
+        
+        
+        
+        
+        # 4. lidar feature랑 image feature 동일한 latent space로 보내기
+        lidar_feature = lidar_feature[valid_mask] # [N, 256] -> [N_new, 256]
+        
+        proj_lidar_feat = self.lidar_projector(lidar_feature) # [N_new, 256] -> [N_new, 128]
+        proj_image_feat = self.image_projector(mean_feat) # [N_new, 256] -> [N_new, 128]
+        
+        
+        
+        
+        # 5. 유사도 계산 및 conf map 생성
+        cosine_sim = F.cosine_similarity(proj_lidar_feat, proj_image_feat, dim=-1) # [N_new]
+        self.similarity = cosine_sim # loss 계산할 때 사용
+        norm_sim = (cosine_sim+1.0)/2.0 # 0~1사이로 정규화 
+        
+        indices_expanded = indices_expanded.view(-1, 2) # [N_new, 25, 2] -> [N_new x 25, 2] # NOTE for문 없이 처리하기 위해 1자로 쭉 펴기
+        flattend_mask = radius_mask.view(-1) # [N_new, 5, 5] -> [N_new x 25] # NOTE 얘도 for문 없이 하려고 1짜로 쭉 펴기
+        repeated_sim = norm_sim.repeat_interleave(self.patch_size**2) # [N_new] -> [N_new x 25] # NOTE 25번 반복
+        repeated_b = valid_b.repeat_interleave(self.patch_size**2) # [N_new] -> [N_new x 25] # NOTE 25번 반복
+        
+        u, v = indices_expanded[:, 0], indices_expanded[:, 1]
+        valid_conf = (u >= 0) & (u < feat_w) & (v >= 0) & (v < feat_h) & flattend_mask.bool() # 경계 검사 + 반지름 검사
+        
+
+        u, v = u[valid_conf], v[valid_conf] # NOTE conf생성할 때 정말로 쓰이는 좌표들만 추출하기
+        repeated_b = repeated_b[valid_conf]
+        repeated_sim = repeated_sim[valid_conf]
+        
+       
+        conf_map_index = repeated_b * feat_h * feat_w + v * feat_w + u
+        conf_map_flat = torch.zeros(B * feat_h * feat_w, device=norm_sim.device) # conf map을 0으로 초기화
+        count_map_flat = torch.zeros_like(conf_map_flat)
+        
+        conf_map_flat = conf_map_flat.scatter_add(0, conf_map_index, repeated_sim) # 0으로 초기화할 때 사용 ㄱㄱ
+        count_map_flat = count_map_flat.scatter_add(0, conf_map_index, torch.ones_like(repeated_sim))
+        
+
+
+        conf_map = (conf_map_flat / count_map_flat.clamp(min=1)) # [B*H*W]
+        
+        
+        #############################################################################################
+        ###              init uncertain parts of the conf map to a particular number             ####
+        ###                                                                                      ####
+        if self.uncertain_init != 0.0:
+            bool_mask = torch.ones(B * feat_h * feat_w, dtype=torch.bool, device=conf_map_index.device) # [B*H*W]
+            bool_mask[conf_map_index] = False
+            not_conf_map_index = torch.arange(B * feat_h * feat_w, device=conf_map_index.device)[bool_mask] # conf_map_index에 없는 인덱스 모음
+            conf_map[not_conf_map_index] = self.uncertain_init
+        #############################################################################################
+        #############################################################################################
+        #############################################################################################
+        
+        conf_map = conf_map.view(B, feat_h, feat_w) # [B*H*W] -> [B, H, W]
+
+        batch_dict['conf_map'] = conf_map
+        return batch_dict
+
+# conf map생성에 문제 없을 경우,  아래 부분 지우기    
+"""
+        # conf_map = (conf_map_flat / count_map_flat.clamp(min=1)).view(B, feat_h, feat_w) # [B, H, W]
+        
+        
+        # batch_dict['conf_map'] = conf_map
+        
+        
+        # return batch_dict
+    
+    
+# bool_mask = torch.ones(B * feat_h * feat_w, dtype=torch.bool, device=conf_map_index.device) # B*W*H
+# bool_mask[conf_map_index] = False
+# not_conf_map_index = torch.arange(B * feat_h * feat_w, device=conf_map_index.device)[bool_mask]
+
+# conf_map = (conf_map_flat / count_map_flat.clamp(min=1))
+# conf_map[not_conf_map_index] = 0.5
+# conf_map = conf_map.view(B, feat_h, feat_w)
+
+# batch_dict['conf_map'] = conf_map
+# return batch_dict
+"""

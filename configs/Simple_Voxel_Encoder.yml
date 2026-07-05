@@ -1,0 +1,460 @@
+# For training simple lidar voxel encoder
+# 라이다 -> voxel 인코더 -> to BEV -> 2D Backbone -> Det Head
+# copied from L4DR_stage2_uem.yml
+# 2025-09-22
+
+### ----- General ----- ###
+GENERAL:
+  NAME: 'Simple_Voxel_Encoder' # logs 안에 들어가는 폴더명
+  COMMENT1: 'Driving corridor, LR 0.001~0.0001'
+  COMMENT2: 'Adam'
+  VERSION: '1.1'
+  SEED: 2023
+  IS_CUDA_SEED: True
+  IS_DETERMINISTIC: True
+  DEVICE: 'gpu'
+  RESUME:
+    IS_RESUME: False
+    PATH_EXP: # None
+    START_EP: # None
+    IS_COPY_LOGS: True
+  FINETUNE: # hj
+    IS_FINETUNE: False
+    PATH_EXP: './logs/L4DR/train_l4dr_reproduction'
+    START_EP: # None
+    IS_COPY_LOGS: True
+  LOGGING:
+    IS_LOGGING: True
+    PATH_LOGGING: './logs'
+    IS_SAVE_MODEL: True
+    INTERVAL_EPOCH_MODEL: 1
+    INTERVAL_EPOCH_UTIL: 5
+### ----- General ----- ###
+
+
+### ----- Dataset ----- ###
+DATASET:
+  NAME: 'KRadarDetection_v2_2' # for camera + 4d radar + lidar fusion
+
+  NUM: # Total number of frames, leave this blank
+
+  path_data:
+    list_dir_kradar: ['./data/kradar']
+    split: ['./resources/split/train.txt', './resources/split/test.txt']
+    revised_label_v2_1: './tools/kradar_revised_label_v2_1/KRadar_revised_visibility'
+  label_version: 'v2_1'
+  item: {
+    'calib': True,
+    'ldr64': True,
+    'ldr128': False,
+    'rdr': False,
+    'rdr_sparse': False,
+    'cam': False,
+  }
+  calib: {
+    'z_offset': 0.7
+  }
+  ldr64: {
+    'processed': False,
+    'skip_line': 13,
+    'n_attr': 9,
+    'inside_ldr64': True,
+    'calib': True,
+    'n_used': 4, # x, y, z, intensity
+  }
+  rdr: {
+    'cube': False,
+  }
+  rdr_sparse: {
+    'processed': True,
+    'dir': './data/rtnh_wider_1p_1',
+    'n_used': 4, # x, y, z, intensity
+    'sample_points': 10240
+  }
+  roi: {
+    'filter': True,
+    'xyz': [0.,-6.4,-2.,72.,6.4,6.0],
+    'keys': ['ldr64_uem'], # ['rdr_sparse'],
+    'check_azimuth_for_rdr': False,
+    'azimuth_deg': [-180,180],
+    'grid_size': ,
+    # 'voxel_size': [0.15, 0.16, 8], # xyz # 디버깅
+    'voxel_size': [0.4, 0.4, 0.4], # xyz
+  }
+  cam: {
+      'front0': True, # rl_3dod에서 왼쪽 이미지를 사용하므로, 나도 front0으로 설정함
+      'front1': False,
+      'left0': False,
+      'left1': False,
+      'right0': False,
+      'right1': False,
+      'rear0': False,
+      'rear1': False,
+  }
+  cam_calib: {
+      'dir':'./resources/cam_calib/common', 
+  }
+  cam_preprocess : {
+    ori_size: [720, 1280], # Do note change
+    crop_size: [640, 1280], # cropped image size
+    scale_size: [320, 640], # scaled image size after cropping      # MUST ALIGN WITH VTRANSFORM'S IMAGE_SIZE
+    mean: [123.675, 116.28, 103.53], 
+    std: [58.395, 57.12, 57.375], 
+    # bgr_to_rgb: False,
+  }
+  label: { # (consider, logit_idx, rgb, bgr)
+    'calib':            True,
+    'onlyR':            False,
+    'consider_cls':     True,
+    'consider_roi':     True,
+    'remove_0_obj':     True,
+    'Sedan':            [True,  1,  [0, 1, 0],       [0,255,0]],
+    'Bus or Truck':     [False, -1, [1, 0.2, 0],     [0,50,255]],
+    'Motorcycle':       [False, -1, [1, 0, 0],       [0,0,255]],
+    'Bicycle':          [False, -1, [1, 1, 0],       [0,255,255]],
+    'Bicycle Group':    [False, -1, [0, 0.5, 1],     [0,128,255]],
+    'Pedestrian':       [False, -1, [0, 0, 1],       [255,0,0]],
+    'Pedestrian Group': [False, -1, [0.4, 0, 1],     [255,0,100]],
+    'Label':            [False, -1, [0.5, 0.5, 0.5], [128,128,128]],
+  }
+  collate_fn: 'v2_0' # 2.0만 camera data 수집함
+  load_from_pickle: './pkl'
+### ----- Dataset ----- ###
+
+### ----- Model ----- ###
+MODEL:
+  FREEZE:
+    # FREEZE_MODULES: ['backbone_3d', 'point_head', 'vfe'] # stage2에서 얼리고 싶은 모듈들
+    FREEZE_MODULES: []
+
+  SKELETON: Voxel_L # hj
+
+  PRE_PROCESSING:
+    VER: 'v1_0'
+    SHUFFLE_POINTS: True
+    TRANSFORM_POINTS_TO_VOXELS: True
+    MAX_POINTS_PER_VOXEL: 32
+    DENOISE_T: 0.3
+    MAX_NUMBER_OF_VOXELS: {
+      'train': 16000, 
+      'test': 40000
+    }
+  
+  # hj
+  ### ----- Camera Branch ----- ###
+  IMG_BACKBONE:
+    type: SwinTransformer
+    embed_dims: 96
+    depths: [2, 2, 6, 2]
+    num_heads: [3, 6, 12, 24]
+    window_size: 7
+    mlp_ratio: 4
+    qkv_bias: true
+    qk_scale: null
+    drop_rate: 0.
+    attn_drop_rate: 0.
+    drop_path_rate: 0.2
+    patch_norm: true
+    out_indices: [1, 2, 3]
+    with_cp: false
+    convert_weights: true
+    init_cfg:
+      type: Pretrained
+      checkpoint: https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_tiny_patch4_window7_224.pth
+
+  IMG_NECK:
+    type: GeneralizedLSSFPN
+    in_channels: [192, 384, 768]
+    out_channels: 256
+    start_level: 0
+    num_outs: 3
+    norm_cfg:
+      type: BN2d
+      requires_grad: true
+    act_cfg:
+      type: ReLU
+      inplace: true
+    upsample_cfg:
+      mode: bilinear
+      align_corners: false
+  
+  VTRANSFORM:
+    type: DepthLSSTransform
+    in_channels: 256
+    out_channels:  64 # 80
+    image_size: [320, 640] # MUST ALIGN WITH cam_preprocess'S scale_size
+    feature_size: [40, 80] # [image_size[0]//8 , image_size[1]//8]
+    xbound: [0.0, 72.0, 0.15]
+    ybound: [-6.4, 6.4, 0.16]
+    zbound: [-2.0, 6.0, 8.0]
+    dbound: [1.0, 72.0, 0.5]
+    downsample: 1 # 원래 2임. 근데 다른 bev feature와 align하려면 downsample하면 안됨
+
+
+  ### ----- Camera Branch ----- ###
+
+
+  ###########################################
+  ### --------------- UEM --------------- ###
+  ###                                     ###
+  UEM_LDR_PREPROCESSOR:
+    NAME: LiDARSparseProcessor_2
+    GRID_SIZE: 0.4
+    INPUT_DIM: 4
+
+  UEM_BACKBONE_3D: # 3d lidar encoder for uem
+    NAME: RL3DFBackbone
+    ENCODING:
+      CHANNEL: [64, 128, 256]
+      STRIDE:  [1, 2, 2]
+      PADDING: [1, 1, 1]
+    TO_BEV:
+      CHANNEL: [256, 256, 256]
+      KERNEL_SIZE: [3, 6, 12]
+      STRIDE:  [1, 2, 4]
+      PADDING: [1, 2, 4]
+
+  UEM: # uncertainty estimation module
+    NAME: UEM
+    PATCH_SIZE: 5
+    UNCERTAIN_INIT: 0.5 # this number will be used to initialize the conf map. MUST BE FLOAT TYPE!
+
+    LOSS_CONFIG:
+        LOSS_WEIGHTS: {
+            'positive': 1.0,
+            'negative': 0.1,
+            # 'uem_loss_weight': 2.0,
+        }
+
+  VOXEL_TO_BEV:
+    NAME: VOXEL_TO_BEV # 실제 클래스명
+
+
+  ###                                     ###
+  ### --------------- UEM --------------- ###
+  ###########################################
+
+
+
+  VFE:
+    NAME: BiDF_PillarVFE
+    WITH_DISTANCE: False
+    USE_ABSLOTE_XYZ: True
+    USE_NORM: True
+    USE_RadarSCORE: True
+    NUM_FILTERS: [64]
+    NUM_FILTERS_Radar: [64]
+
+  BACKBONE_3D:
+    NAME: PointNet2MSG
+    SA_CONFIG:
+        USE_RAWDIM : 4
+        NPOINTS: [4096, 1024, 256, 64]
+        RADIUS: [[0.1, 0.5], [0.5, 1.0], [1.0, 2.0], [2.0, 4.0]]
+        NSAMPLE: [[16, 32], [16, 32], [16, 32], [16, 32]]
+        MLPS: [[[16, 16, 32], [32, 32, 64]],
+                [[64, 64, 128], [64, 96, 128]],
+                [[128, 196, 256], [128, 196, 256]],
+                [[256, 256, 512], [256, 384, 512]]]
+    FP_MLPS: [[128, 128], [256, 256], [512, 512], [512, 512]]
+
+  MAP_TO_BEV: 
+    NAME: PointPillarScatter
+    NUM_BEV_FEATURES: [64,64]
+
+  POINT_HEAD:
+    NAME: PointHeadPreMask
+    CLS_FC: [256, 256]
+    CLASS_AGNOSTIC: False
+    USE_POINT_FEATURES_BEFORE_FUSION: False
+    TARGET_CONFIG:
+        GT_EXTRA_WIDTH: [0.2, 0.2, 0.2]
+        BOX_CODER: PointResidualCoder
+        BOX_CODER_CONFIG: {
+            'use_mean_size': True,
+            'mean_size': [
+                [3.9, 1.6, 1.56],
+                [0.8, 0.6, 1.73],
+                [1.76, 0.6, 1.73]
+            ]
+        }
+
+    LOSS_CONFIG:
+        LOSS_REG: WeightedSmoothL1Loss
+        LOSS_WEIGHTS: {
+            'point_cls_weight': 2.0,
+            'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        }
+
+  BACKBONE_2D:
+    NAME: BaseBEVBackbone_MF_cam # 내가 직접 수정한 clr fusion용 bev 인코더
+    LAYER_NUMS: [3, 5, 5]
+    LAYER_STRIDES: [2, 2, 2]
+    NUM_FILTERS: [192, 256, 512] # [128, 256, 512] -> [192, 256, 512]
+    UPSAMPLE_STRIDES: [1, 2, 4]
+    NUM_UPSAMPLE_FILTERS: [192, 192, 192] # [128, 128, 128] -> [192, 192, 192]
+
+  DENSE_HEAD:
+    NAME: AnchorHeadSingle
+    CLASS_AGNOSTIC: False
+    CLASS_NAMES_EACH_HEAD: [
+      # [ 'Sedan', 'Bus or Truck' ]
+    ]
+    USE_DIRECTION_CLASSIFIER: True
+    DIR_OFFSET: 0.78539
+    DIR_LIMIT_OFFSET: 0.0
+    NUM_DIR_BINS: 2
+
+    ANCHOR_GENERATOR_CONFIG: [
+      {
+          'class_name': 'Sedan',
+          'anchor_sizes': [[4.2, 2.1, 2.0]],
+          'anchor_rotations': [0, 1.57],
+          'anchor_bottom_heights': [-1.08],
+          'align_center': False,
+          'feature_map_stride': 1, # 이거 중요! 이 값으로 grid_size를 나눔
+          'matched_threshold': 0.6,
+          'unmatched_threshold': 0.45
+      },
+    ]
+
+    TARGET_ASSIGNER_CONFIG:
+      NAME: AxisAlignedTargetAssigner
+      POS_FRACTION: -1.0
+      SAMPLE_SIZE: 512
+      NORM_BY_NUM_EXAMPLES: False
+      MATCH_HEIGHT: False
+      BOX_CODER: ResidualCoder
+
+    LOSS_CONFIG:
+      LOSS_WEIGHTS: {
+        'cls_weight': 1.0,
+        'loc_weight': 2.0,
+        'dir_weight': 0.2,
+        'code_weights': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      }
+
+    POST_PROCESSING:
+      RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+      SCORE_THRESH: 0.1
+      OUTPUT_RAW_SCORE: False
+
+      EVAL_METRIC: kitti
+
+      NMS_CONFIG:
+        MULTI_CLASSES_NMS: False
+        NMS_TYPE: nms_gpu
+        NMS_THRESH: 0.01
+        NMS_PRE_MAXSIZE: 4096
+        NMS_POST_MAXSIZE: 500
+
+  POST_PROCESSING:
+    RECALL_THRESH_LIST: [0.3, 0.5, 0.7]
+    SCORE_THRESH: 0.1
+    OUTPUT_RAW_SCORE: False
+
+    EVAL_METRIC: kitti
+
+    NMS_CONFIG:
+      MULTI_CLASSES_NMS: False
+      NMS_TYPE: nms_gpu
+      NMS_THRESH: 0.7
+      NMS_PRE_MAXSIZE: 4096
+      NMS_POST_MAXSIZE: 500
+### ----- Model ----- ###
+
+### ----- Optimizer ----- ###
+get_loss_from: 'detector'
+OPTIMIZER: # Training
+  NAME: 'AdamW'
+
+  LR: 0.001
+  MIN_LR: 0.0001 # for scheduler
+  BETAS: [0.9, 0.999]
+  WEIGHT_DECAY: 0.01
+  MOMENTUM: 0.9
+
+  BATCH_SIZE: 4
+  NUM_WORKERS: 16 # 0 for debug, 16 for training
+
+  MAX_EPOCH: 35
+  
+  SCHEDULER: 'CosineAnnealingLR' # in [None (empty), 'LambdaLR', 'CosineAnnealingLR']
+  TYPE_TOTAL_ITER: 'every' # in ['every', 'all'] / every epoch
+### ----- Optimizer ----- ###
+
+### ----- Validation ----- ###
+cfg_eval_ver2: True
+VAL:
+  IS_VALIDATE: False
+  IS_CONSIDER_VAL_SUBSET: True
+  VAL_PER_EPOCH_SUBSET: 1
+  NUM_SUBSET: 500 # 500
+  VAL_PER_EPOCH_FULL: 11 # epoch for validate full dataset
+
+  LIST_VAL_CONF_THR: [0.3, 0.5, 0.7]
+  LIST_VAL_IOU: [0.7, 0.5, 0.3]
+  # This is for logging, change the iou threshold in 'utils/kitti_eval'
+
+  CLASS_VAL_KEYWORD: {
+    'Sedan': 'sed',
+    'Bus or Truck': 'bus',
+    'Motorcycle': 'mot',
+    'Bicycle': 'bic',
+    'Bicycle Group': 'big',
+    'Pedestrian': 'ped',
+    'Pedestrian Group': 'peg'
+  }
+
+  REGARDING: 'anchor' # in ['anchor']
+  LIST_CARE_VAL: ['Sedan']
+### ----- Validation ----- ###
+
+### ----- Visualization ----- ###
+VIS:
+  # OpenCV
+  CLASS_BGR: {
+    'Sedan': [0,255,0],
+    'Bus or Truck': [0,50,255],
+    'Motorcycle': [0,0,255],
+    'Bicycle': [0,255,255],
+    'Pedestrian': [255,0,0],
+    'Pedestrian Group': [255,0,100],
+    'Label': [128,128,128]
+  }
+
+  # Open3D
+  CLASS_RGB: {
+    'Sedan': [0, 1, 0],
+    'Bus or Truck': [1, 0.2, 0],
+    'Motorcycle': [1, 0, 0],
+    'Bicycle': [1, 1, 0],
+    'Pedestrian': [0, 0, 1],
+    'Pedestrian Group': [0.4, 0, 1],
+    'Label': [0.5, 0.5, 0.5]
+  }
+  
+  ROI:
+    TYPE: 'default' # ['default', 'cube']
+    DEFAULT: [0,100,-40,40,-10,60] # x_min_max, y_min_max, z_min_max / Dim: [m]
+
+  # For BEV model visualization
+  Z_CENTER: {
+    'Sedan': 0.5,
+    'Bus or Truck': 1.5,
+    'Motorcycle': 0.5,
+    'Bicycle': 0.5,
+    'Pedestrian': 0.5,
+    'Pedestrian Group': 0.5,
+  }
+
+  # For BEV model visualization
+  Z_HEIGHT: {
+    'Sedan': 1.9,
+    'Bus or Truck': 1.9,
+    'Motorcycle': -1,
+    'Bicycle': -1,
+    'Pedestrian': 2,
+    'Pedestrian Group': -1,
+  }
+### ----- Visualization ----- ###

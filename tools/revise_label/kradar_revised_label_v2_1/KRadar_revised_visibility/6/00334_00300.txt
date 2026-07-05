@@ -1,0 +1,1 @@
+* idx(tesseract_os2-64_cam-front_os1-128_cam-lrr)=00334_00300_00899_00300_00900, timestamp=1643295874.004074855
