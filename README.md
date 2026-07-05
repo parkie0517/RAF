@@ -13,7 +13,7 @@ For setup, please refer to the official [K-Radar](https://github.com/kaist-avela
 
 ## Acknowledgements
 
-We thank the authors of [K-Radar](https://github.com/kaist-avelab/K-Radar) and [L4DR](https://github.com/ylwhxht/L4DR) for releasing their datasets and codebases, which provide valuable resources for LiDAR-RADAR 3D object detection research in adverse weather.
+We thank the authors of [K-Radar](https://github.com/kaist-avelab/K-Radar) and [L4DR](https://github.com/ylwhxht/L4DR) for releasing their datasets and codebases, which provide valuable resources for 3D object detection research in adverse weather.
 
 ## Citation
 
